@@ -14,7 +14,7 @@ class AgentMemory:
     context window, and accumulates extracted data across steps.
     """
 
-    def __init__(self, max_history: int = 10) -> None:
+    def __init__(self, max_history: int = 5) -> None:
         self.max_history = max_history
         self._history: list[dict[str, Any]] = []
         self._results: list[dict[str, Any]] = []

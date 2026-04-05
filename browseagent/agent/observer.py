@@ -11,18 +11,27 @@ logger = logging.getLogger(__name__)
 
 
 async def observe_page(driver: BrowserDriver, take_screenshot: bool = False) -> ObservationSchema:
-    """Capture the current page state as an ObservationSchema.
+    """Capture the current page state as an ObservationSchema."""
+    # Wait for any in-flight navigation to settle
+    try:
+        await driver.page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except Exception:
+        pass
 
-    Args:
-        driver: The active BrowserDriver instance.
-        take_screenshot: Whether to capture a screenshot (adds latency + tokens).
+    try:
+        url = await driver.get_url()
+    except Exception:
+        url = "unknown"
 
-    Returns:
-        An ObservationSchema with URL, title, simplified DOM, and optional screenshot.
-    """
-    url = await driver.get_url()
-    title = await driver.get_title()
-    dom_text = await driver.get_dom_simplified()
+    try:
+        title = await driver.get_title()
+    except Exception:
+        title = ""
+
+    try:
+        dom_text = await driver.get_dom_simplified()
+    except Exception:
+        dom_text = ""
 
     screenshot_b64: str | None = None
     if take_screenshot:
@@ -31,12 +40,9 @@ async def observe_page(driver: BrowserDriver, take_screenshot: bool = False) -> 
         except Exception as exc:
             logger.warning("Screenshot capture failed: %s", exc)
 
-    observation = ObservationSchema(
+    return ObservationSchema(
         url=url,
         title=title,
         dom_text=dom_text,
         screenshot_b64=screenshot_b64,
     )
-
-    logger.debug("Observed: %s (%s) — DOM length: %d chars", url, title, len(dom_text))
-    return observation

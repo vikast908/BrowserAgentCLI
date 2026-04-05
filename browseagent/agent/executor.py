@@ -114,17 +114,22 @@ class AgentExecutor:
             observation = await observe_page(self.driver, take_screenshot=self.take_screenshots)
 
             # 4b. Ask LLM for next action
-            # Truncate DOM to avoid overwhelming the model
+            # Truncate DOM to fit within model context
             dom_text = observation.dom_text
-            if len(dom_text) > 6000:
-                dom_text = dom_text[:6000] + "\n... (truncated)"
+            if len(dom_text) > 50000:
+                dom_text = dom_text[:50000] + "\n..."
+
+            # Skip screenshot embedding for local models (saves tokens)
+            ss_b64 = None
+            if self.llm.provider != "lm_studio":
+                ss_b64 = observation.screenshot_b64
 
             messages = build_executor_messages(
                 task=task,
                 plan_summary=self.plan.plan_summary,
                 observation_dom=dom_text,
                 action_history=self.memory.action_history,
-                screenshot_b64=observation.screenshot_b64,
+                screenshot_b64=ss_b64,
             )
 
             action = await self.llm.chat_structured(

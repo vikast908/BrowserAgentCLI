@@ -44,42 +44,41 @@ def run(
     """
     settings = load_settings()
 
-    from browseagent.agent.executor import AgentExecutor
     from browseagent.cli.display import (
         show_completion,
         show_data_table,
         show_error,
         show_failure,
-        show_plan,
         show_saved_file,
         show_step,
     )
+    from browseagent.engine import run_task
 
-    executor = AgentExecutor(
-        settings=settings,
-        provider=provider,
-        model=model,
-        headless=headless,
-        max_steps=max_steps,
-        take_screenshots=screenshot,
-    )
-
-    # Wire up display callbacks
-    def on_plan(plan):
-        show_plan(plan.goal, plan.steps_estimate, plan.first_url, plan.plan_summary)
-
-    def on_step(step_num, max_s, desc):
+    def on_step_cb(step_num, max_s, desc):
         show_step(step_num, max_s, desc)
 
-    def on_error(step_num, error_msg):
+    def on_error_cb(step_num, error_msg):
         show_error(step_num, error_msg)
 
-    executor.on_plan = on_plan
-    executor.on_step = on_step
-    executor.on_error = on_error
+    def on_status_cb(state, data):
+        if state == "planning":
+            console.print(f"  [cyan]*[/cyan] Planning task...")
+        elif state == "launching":
+            console.print(f"  [cyan]*[/cyan] Launching browser...")
+        elif state == "info":
+            console.print(f"  [cyan]*[/cyan] {data.get('message', '')}")
 
-    # Run the agent
-    result = asyncio.run(executor.run(task))
+    result = asyncio.run(run_task(
+        task=task,
+        model=model or settings.default_model,
+        provider=provider or settings.default_provider,
+        lm_studio_url=settings.lm_studio_url,
+        max_steps=max_steps or settings.max_steps,
+        headless=headless if headless is not None else settings.headless,
+        on_step=on_step_cb,
+        on_error=on_error_cb,
+        on_status=on_status_cb,
+    ))
 
     # Display results
     if result.status == "completed":
@@ -95,8 +94,8 @@ def run(
         _save_output(result, output)
         show_saved_file(output)
 
-    # Always save to run history
-    _save_run(result, settings)
+    # Save to history
+    _save_run_result(result, settings)
 
 
 @cli.command()
@@ -232,11 +231,31 @@ def _save_output(result, output_path: str) -> None:
 
 
 def _save_run(result, settings: Settings) -> None:
-    """Persist run metadata to SQLite."""
+    """Persist run metadata to SQLite (RunResultSchema)."""
     from browseagent.storage.runs import RunStore
 
     store = RunStore(settings.runs_dir)
     store.save_run(result)
+
+
+def _save_run_result(result, settings: Settings) -> None:
+    """Persist EngineResult to SQLite."""
+    from browseagent.llm.schemas import PlanSchema, RunResultSchema
+    from browseagent.storage.runs import RunStore
+
+    run_result = RunResultSchema(
+        run_id=result.run_id,
+        task=result.task,
+        plan=PlanSchema(goal=result.task, steps_estimate=0, first_url="", plan_summary=""),
+        data=result.data,
+        total_steps=result.total_steps,
+        elapsed_seconds=result.elapsed_seconds,
+        status=result.status,
+        started_at=result.started_at,
+        finished_at=result.finished_at,
+    )
+    store = RunStore(settings.runs_dir)
+    store.save_run(run_result)
 
 
 if __name__ == "__main__":

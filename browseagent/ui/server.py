@@ -5,21 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from browseagent.agent.executor import AgentExecutor
-from browseagent.browser.extractor import extract_by_llm_data
-from browseagent.config import Settings, load_settings
-from browseagent.llm.schemas import ActionType, PlanSchema, RunResultSchema
-from browseagent.storage.runs import RunStore
+from browseagent.config import load_settings
+from browseagent.engine import EngineResult, run_browser_use
 
 logger = logging.getLogger(__name__)
 
@@ -30,334 +24,235 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 class UISession:
-    """Manages a single agent run driven from the web UI.
+    """Manages a single agent run driven from the web UI."""
 
-    Bridges the AgentExecutor to the WebSocket, streaming screenshots,
-    step updates, and handling pause/resume/takeover commands.
-    """
-
-    def __init__(self, ws: WebSocket, settings: Settings) -> None:
+    def __init__(self, ws: WebSocket) -> None:
         self.ws = ws
-        self.settings = settings
-        self.executor: AgentExecutor | None = None
+        self.settings = load_settings()
         self._paused = asyncio.Event()
-        self._paused.set()  # Not paused initially
+        self._paused.set()
         self._stopped = False
-        self._screenshot_task: asyncio.Task | None = None
+        self._takeover = False
+        self._current_page = None  # Playwright page for manual control
         self._run_task: asyncio.Task | None = None
-        self._takeover_active = False
+        self._screenshot_task: asyncio.Task | None = None
 
     async def send(self, msg_type: str, data: dict[str, Any] | None = None) -> None:
-        """Send a typed JSON message over the WebSocket."""
         try:
             await self.ws.send_json({"type": msg_type, **(data or {})})
         except Exception:
-            pass  # Connection may have closed
+            pass
 
-    async def run_task(self, task: str) -> None:
-        """Execute an agent task with live UI streaming."""
+    # ── Run task via engine ────────────────────────────
+    async def run(self, task: str, max_steps: int = 40) -> None:
         self._stopped = False
         self._paused.set()
-        self._takeover_active = False
+        self._takeover = False
 
-        # Always launch visible (not headless) for the UI
-        self.executor = AgentExecutor(
-            settings=self.settings,
-            headless=False,
-            max_steps=self.settings.max_steps,
-            take_screenshots=True,
-        )
+        def on_step(step, max_s, desc):
+            asyncio.create_task(self.send("step", {
+                "step": step, "max_steps": max_s, "description": desc,
+            }))
 
-        # Wire up callbacks
-        self.executor.on_plan = self._on_plan
-        self.executor.on_step = self._on_step
-        self.executor.on_error = self._on_error
+        def on_screenshot(b64):
+            asyncio.create_task(self.send("screenshot", {"image": b64}))
 
-        await self.send("status", {"state": "planning", "task": task})
+        def on_error(step, msg):
+            asyncio.create_task(self.send("step_error", {"step": step, "error": msg}))
 
-        start_time = time.time()
-        started_at = datetime.now()
+        def on_status(state, data):
+            asyncio.create_task(self.send("status", {"state": state, **data}))
+
+        def store_page(page):
+            self._current_page = page
+
+        # Start background screenshot streaming for manual control
+        self._screenshot_task = asyncio.create_task(self._stream_screenshots())
 
         try:
-            # Phase 1: Plan
-            from browseagent.agent.planner import plan_task
-            plan = await plan_task(self.executor.llm, task)
-            self.executor.plan = plan
-            self._on_plan(plan)
-
-            # Phase 2: Launch browser
-            await self.send("status", {"state": "launching"})
-            await self.executor.driver.launch()
-            await self.executor.driver.navigate(plan.first_url)
-
-            # Start screenshot streaming
-            self._screenshot_task = asyncio.create_task(self._stream_screenshots())
-
-            # Phase 3: Run the execution loop with pause/stop support
-            status = await self._ui_execution_loop(task)
-
+            result = await run_browser_use(
+                task=task,
+                model=self.settings.default_model,
+                provider=self.settings.default_provider,
+                lm_studio_url=self.settings.lm_studio_url,
+                max_steps=max_steps,
+                max_actions_per_step=10,
+                headless=False,
+                on_step=on_step,
+                on_screenshot=on_screenshot,
+                on_error=on_error,
+                on_status=on_status,
+                pause_event=self._paused,
+                stop_flag=lambda: self._stopped,
+                takeover_flag=lambda: self._takeover,
+                get_page_callback=store_page,
+            )
         except Exception as exc:
-            logger.error("UI agent run failed: %s", exc)
-            status = "failed"
-            await self.send("error", {"message": str(exc)})
-        finally:
-            if self._screenshot_task:
-                self._screenshot_task.cancel()
-                try:
-                    await self._screenshot_task
-                except asyncio.CancelledError:
-                    pass
-            await self.executor.driver.close()
+            logger.error("Run failed: %s", exc)
+            result = EngineResult()
+            result.status = "failed"
+            result.task = task
 
-        elapsed = time.time() - start_time
-        result = RunResultSchema(
-            run_id=self.executor.run_id,
-            task=task,
-            plan=plan if "plan" in dir() else PlanSchema(goal=task, steps_estimate=0, first_url="", plan_summary=""),
-            steps=self.executor.memory.all_steps,
-            data=self.executor.memory.all_results,
-            total_steps=self.executor.memory.step_count,
-            elapsed_seconds=round(elapsed, 2),
-            status=status,
-            started_at=started_at,
-            finished_at=datetime.now(),
+        if self._screenshot_task:
+            self._screenshot_task.cancel()
+            try:
+                await self._screenshot_task
+            except asyncio.CancelledError:
+                pass
+
+        # Save to history
+        from browseagent.storage.runs import RunStore
+        from browseagent.llm.schemas import PlanSchema, RunResultSchema
+
+        run_result = RunResultSchema(
+            run_id=result.run_id,
+            task=result.task,
+            plan=PlanSchema(goal=result.task, steps_estimate=0, first_url="", plan_summary=""),
+            data=result.data,
+            total_steps=result.total_steps,
+            elapsed_seconds=result.elapsed_seconds,
+            status=result.status,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
         )
-
-        # Save run
-        store = RunStore(self.settings.runs_dir)
-        store.save_run(result)
+        try:
+            store = RunStore(self.settings.runs_dir)
+            store.save_run(run_result)
+        except Exception:
+            pass
 
         await self.send("completed", {
-            "status": status,
+            "status": result.status,
             "total_steps": result.total_steps,
             "elapsed": result.elapsed_seconds,
             "data": result.data,
             "run_id": result.run_id,
         })
 
-    async def _ui_execution_loop(self, task: str) -> str:
-        """Execution loop with pause/stop/takeover support."""
-        assert self.executor is not None and self.executor.plan is not None
-        plan = self.executor.plan
-        memory = self.executor.memory
-        driver = self.executor.driver
-        llm = self.executor.llm
-
-        from browseagent.agent.observer import observe_page
-        from browseagent.browser.extractor import extract_list_items
-        from browseagent.llm.prompts import build_executor_messages
-        from browseagent.llm.schemas import ActionSchema, StepRecord
-
-        for step_num in range(1, self.executor.max_steps + 1):
-            # Check stop
-            if self._stopped:
-                return "stopped"
-
-            # Check pause — wait until resumed
-            await self._paused.wait()
-
-            # If takeover is active, just wait until user resumes
-            if self._takeover_active:
-                await self.send("status", {"state": "takeover"})
-                while self._takeover_active and not self._stopped:
-                    await asyncio.sleep(0.5)
-                if self._stopped:
-                    return "stopped"
-                continue
-
-            # Observe
-            observation = await observe_page(driver, take_screenshot=True)
-
-            # Send screenshot
-            if observation.screenshot_b64:
-                await self.send("screenshot", {"image": observation.screenshot_b64})
-
-            # Truncate DOM
-            dom_text = observation.dom_text
-            if len(dom_text) > 6000:
-                dom_text = dom_text[:6000] + "\n... (truncated)"
-
-            # Decide
-            messages = build_executor_messages(
-                task=task,
-                plan_summary=plan.plan_summary,
-                observation_dom=dom_text,
-                action_history=memory.action_history,
-                screenshot_b64=observation.screenshot_b64,
-            )
-
-            action = await llm.chat_structured(
-                messages=messages,
-                schema=ActionSchema,
-                temperature=0.1,
-                max_tokens=4000,
-            )
-            assert isinstance(action, ActionSchema)
-
-            # Notify UI
-            action_desc = f"{action.action.value}"
-            if action.target:
-                action_desc += f" → {action.target}"
-            self._on_step(step_num, self.executor.max_steps, action_desc)
-
-            # Done?
-            if action.action == ActionType.DONE:
-                if action.data:
-                    normalized = await extract_by_llm_data(action.data)
-                    memory.add_results(normalized)
-                step_record = StepRecord(
-                    step_number=step_num, observation=observation,
-                    action=action, success=True,
-                )
-                memory.record_step(step_record)
-                memory.record_action(action, success=True)
-
-                # Final screenshot
+    # ── Screenshot streaming ──────────────────────────
+    async def _stream_screenshots(self) -> None:
+        while not self._stopped:
+            if self._current_page and self._takeover:
                 try:
-                    final_ss = await driver.screenshot()
-                    await self.send("screenshot", {"image": final_ss})
+                    session_id = await self._current_page._ensure_session()
+                    ss = await self._current_page._client.send(
+                        "Page.captureScreenshot",
+                        {"format": "png"},
+                        session_id=session_id,
+                    )
+                    if ss and "data" in ss:
+                        await self.send("screenshot", {"image": ss["data"]})
                 except Exception:
                     pass
+            await asyncio.sleep(0.6)
 
-                return "completed"
-
-            # Execute
-            success = await driver.execute_action(action)
-
-            # Handle extract
-            if action.action == ActionType.EXTRACT:
-                if action.data:
-                    normalized = await extract_by_llm_data(action.data)
-                    memory.add_results(normalized)
-                elif action.target:
-                    try:
-                        selector = action.target.strip()
-                        if selector.startswith("[") and selector.endswith("]") and "=" not in selector:
-                            selector = selector[1:-1]
-                        items = await extract_list_items(driver.page, selector)
-                        if items:
-                            memory.add_results(items)
-                    except Exception as exc:
-                        logger.warning("DOM extraction failed for %s: %s", action.target, exc)
-
-            # Update memory
-            error_msg = None if success else f"Failed to execute {action.action.value} on {action.target}"
-            memory.record_action(action, success=success, error=error_msg)
-            step_record = StepRecord(
-                step_number=step_num, observation=observation,
-                action=action, success=success, error=error_msg,
-            )
-            memory.record_step(step_record)
-
-            if not success:
-                self._on_error(step_num, error_msg or "unknown error")
-                recent_failures = sum(
-                    1 for h in memory.action_history[-3:]
-                    if h.get("error") and h.get("target") == action.target
-                )
-                if recent_failures >= 2:
-                    continue
-
-            # Small delay so screenshots can be seen
-            await asyncio.sleep(0.3)
-
-        return "max_steps_reached"
-
-    async def _stream_screenshots(self) -> None:
-        """Continuously stream browser screenshots to the UI."""
-        while not self._stopped:
+    # ── Manual control ────────────────────────────────
+    async def mouse_click(self, x: int, y: int) -> None:
+        if self._current_page:
             try:
-                if self.executor and self.executor.driver._page:
-                    ss = await self.executor.driver.screenshot()
-                    await self.send("screenshot", {"image": ss})
-            except Exception:
-                pass
-            await asyncio.sleep(0.8)
+                session_id = await self._current_page._ensure_session()
+                # Use CDP Input.dispatchMouseEvent for precise clicks
+                await self._current_page._client.send(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+                    session_id=session_id,
+                )
+                await self._current_page._client.send(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+                    session_id=session_id,
+                )
+                await asyncio.sleep(0.3)
+                ss = await self._current_page._client.send(
+                    "Page.captureScreenshot", {"format": "png"}, session_id=session_id,
+                )
+                if ss and "data" in ss:
+                    await self.send("screenshot", {"image": ss["data"]})
+            except Exception as exc:
+                logger.warning("Click failed: %s", exc)
 
-    def _on_plan(self, plan: PlanSchema) -> None:
-        asyncio.create_task(self.send("plan", {
-            "goal": plan.goal,
-            "steps_estimate": plan.steps_estimate,
-            "first_url": plan.first_url,
-            "plan_summary": plan.plan_summary,
-        }))
+    async def mouse_dblclick(self, x: int, y: int) -> None:
+        if self._current_page:
+            try:
+                session_id = await self._current_page._ensure_session()
+                await self._current_page._client.send(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2},
+                    session_id=session_id,
+                )
+                await self._current_page._client.send(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2},
+                    session_id=session_id,
+                )
+                await asyncio.sleep(0.3)
+                ss = await self._current_page._client.send(
+                    "Page.captureScreenshot", {"format": "png"}, session_id=session_id,
+                )
+                if ss and "data" in ss:
+                    await self.send("screenshot", {"image": ss["data"]})
+            except Exception as exc:
+                logger.warning("Double-click failed: %s", exc)
 
-    def _on_step(self, step_num: int, max_steps: int, desc: str) -> None:
-        asyncio.create_task(self.send("step", {
-            "step": step_num,
-            "max_steps": max_steps,
-            "description": desc,
-        }))
+    async def key_press(self, key: str) -> None:
+        if self._current_page and key:
+            try:
+                session_id = await self._current_page._ensure_session()
+                await self._current_page._client.send(
+                    "Input.dispatchKeyEvent",
+                    {"type": "keyDown", "key": key},
+                    session_id=session_id,
+                )
+                await self._current_page._client.send(
+                    "Input.dispatchKeyEvent",
+                    {"type": "keyUp", "key": key},
+                    session_id=session_id,
+                )
+                await asyncio.sleep(0.15)
+                ss = await self._current_page._client.send(
+                    "Page.captureScreenshot", {"format": "png"}, session_id=session_id,
+                )
+                if ss and "data" in ss:
+                    await self.send("screenshot", {"image": ss["data"]})
+            except Exception as exc:
+                logger.warning("Key press failed: %s", exc)
 
-    def _on_error(self, step_num: int, error_msg: str) -> None:
-        asyncio.create_task(self.send("step_error", {
-            "step": step_num,
-            "error": error_msg,
-        }))
+    async def type_text(self, text: str) -> None:
+        if self._current_page and text:
+            try:
+                session_id = await self._current_page._ensure_session()
+                for char in text:
+                    await self._current_page._client.send(
+                        "Input.dispatchKeyEvent",
+                        {"type": "char", "text": char},
+                        session_id=session_id,
+                    )
+                await asyncio.sleep(0.1)
+                ss = await self._current_page._client.send(
+                    "Page.captureScreenshot", {"format": "png"}, session_id=session_id,
+                )
+                if ss and "data" in ss:
+                    await self.send("screenshot", {"image": ss["data"]})
+            except Exception as exc:
+                logger.warning("Type text failed: %s", exc)
 
     def pause(self) -> None:
         self._paused.clear()
 
     def resume(self) -> None:
-        self._takeover_active = False
+        self._takeover = False
         self._paused.set()
 
     def stop(self) -> None:
         self._stopped = True
-        self._paused.set()  # Unblock if paused
+        self._paused.set()
 
     def takeover(self) -> None:
-        """User takes manual control of the browser."""
-        self._takeover_active = True
-        self._paused.set()  # Don't block the loop, let it enter takeover wait
-
-    async def mouse_click(self, x: int, y: int) -> None:
-        """Forward a mouse click to the browser at (x, y) viewport coords."""
-        if self.executor and self.executor.driver._page:
-            try:
-                await self.executor.driver._page.mouse.click(x, y)
-                # Send updated screenshot immediately
-                await asyncio.sleep(0.3)
-                ss = await self.executor.driver.screenshot()
-                await self.send("screenshot", {"image": ss})
-            except Exception as exc:
-                logger.warning("Mouse click failed at (%d, %d): %s", x, y, exc)
-
-    async def mouse_dblclick(self, x: int, y: int) -> None:
-        """Forward a double-click to the browser."""
-        if self.executor and self.executor.driver._page:
-            try:
-                await self.executor.driver._page.mouse.dblclick(x, y)
-                await asyncio.sleep(0.3)
-                ss = await self.executor.driver.screenshot()
-                await self.send("screenshot", {"image": ss})
-            except Exception as exc:
-                logger.warning("Double-click failed at (%d, %d): %s", x, y, exc)
-
-    async def key_press(self, key: str) -> None:
-        """Forward a key press to the browser."""
-        if self.executor and self.executor.driver._page and key:
-            try:
-                await self.executor.driver._page.keyboard.press(key)
-                await asyncio.sleep(0.15)
-                ss = await self.executor.driver.screenshot()
-                await self.send("screenshot", {"image": ss})
-            except Exception as exc:
-                logger.warning("Key press failed (%s): %s", key, exc)
-
-    async def type_text(self, text: str) -> None:
-        """Forward typed text to the browser (single characters)."""
-        if self.executor and self.executor.driver._page and text:
-            try:
-                await self.executor.driver._page.keyboard.type(text)
-                await asyncio.sleep(0.1)
-                ss = await self.executor.driver.screenshot()
-                await self.send("screenshot", {"image": ss})
-            except Exception as exc:
-                logger.warning("Type text failed (%s): %s", text, exc)
+        self._takeover = True
+        self._paused.set()
 
 
-# Active sessions keyed by WebSocket
+# ── Routes ────────────────────────────────────────────
 _sessions: dict[int, UISession] = {}
 
 
@@ -369,10 +264,9 @@ async def index():
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    settings = load_settings()
-    session = UISession(ws, settings)
-    session_id = id(ws)
-    _sessions[session_id] = session
+    session = UISession(ws)
+    sid = id(ws)
+    _sessions[sid] = session
 
     await session.send("connected", {"message": "BrowseAgent UI connected"})
 
@@ -383,53 +277,44 @@ async def websocket_endpoint(ws: WebSocket):
             cmd = msg.get("command")
 
             if cmd == "run":
-                task = msg.get("task", "")
-                if task.strip():
-                    # Run in background so we can still receive commands
-                    session._run_task = asyncio.create_task(session.run_task(task))
-
+                task = msg.get("task", "").strip()
+                if task:
+                    session._run_task = asyncio.create_task(
+                        session.run(task, max_steps=session.settings.max_steps)
+                    )
             elif cmd == "pause":
                 session.pause()
                 await session.send("status", {"state": "paused"})
-
             elif cmd == "resume":
                 session.resume()
                 await session.send("status", {"state": "running"})
-
             elif cmd == "stop":
                 session.stop()
                 await session.send("status", {"state": "stopped"})
-
             elif cmd == "takeover":
                 session.takeover()
                 await session.send("status", {"state": "takeover"})
-
             elif cmd == "mouse_click":
                 await session.mouse_click(msg.get("x", 0), msg.get("y", 0))
-
             elif cmd == "mouse_dblclick":
                 await session.mouse_dblclick(msg.get("x", 0), msg.get("y", 0))
-
             elif cmd == "key_press":
                 await session.key_press(msg.get("key", ""))
-
             elif cmd == "type_text":
                 await session.type_text(msg.get("text", ""))
-
             elif cmd == "update_settings":
                 if "max_steps" in msg:
-                    settings.max_steps = int(msg["max_steps"])
+                    session.settings.max_steps = int(msg["max_steps"])
                 if "model" in msg:
-                    settings.default_model = msg["model"]
+                    session.settings.default_model = msg["model"]
                 await session.send("status", {"state": "settings_updated"})
 
     except WebSocketDisconnect:
         session.stop()
     finally:
-        _sessions.pop(session_id, None)
+        _sessions.pop(sid, None)
 
 
 def start_server(host: str = "127.0.0.1", port: int = 8899) -> None:
-    """Launch the UI server."""
     import uvicorn
     uvicorn.run(app, host=host, port=port, log_level="info")

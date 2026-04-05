@@ -2,23 +2,19 @@
 
 **Autonomous browser automation from the command line, powered by LLMs.**
 
-BrowseAgent accepts natural language tasks and executes them by autonomously controlling a headless browser. Describe what you want — the agent plans, navigates, interacts, extracts, and returns structured data.
+BrowseAgent accepts natural language tasks and executes them by autonomously controlling a browser. Describe what you want — the agent plans, navigates, interacts, extracts, and returns structured data. Comes with a **web UI** for live browser viewing and manual takeover control.
 
 ```
 $ agent run "go to books.toscrape.com and get titles of the first 5 books"
 
-  ◎ Planning task...
-    Goal: Extract titles of the first 5 books from books.toscrape.com
-    Strategy: Navigate to homepage, locate book listings, extract titles
-    Start URL: https://books.toscrape.com/
-    Estimated steps: 5
+  * Planning task...
+  * Launching browser...
 
-  ◎ Step 1/8 → click → a
-  ◎ Step 2/8 → extract → a
-  ◎ Step 3/8 → done
+  Step 1/10: navigate → https://books.toscrape.com
+  Step 2/10: extract, done
 
-  ✓ Task complete in 3 steps (30.3s)
-    Extracted 5 items
+  Task complete in 2 steps (18.4s)
+  Extracted 5 items
 
 ┌───────────────────────────────────────┐
 │ title                                 │
@@ -39,6 +35,8 @@ $ agent run "go to books.toscrape.com and get titles of the first 5 books"
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [Engines](#engines)
+- [Web UI](#web-ui)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -46,7 +44,6 @@ $ agent run "go to books.toscrape.com and get titles of the first 5 books"
 - [Configuration](#configuration)
 - [LLM Providers](#llm-providers)
 - [Project Structure](#project-structure)
-- [Module Reference](#module-reference)
 - [Limitations & Guardrails](#limitations--guardrails)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -56,200 +53,225 @@ $ agent run "go to books.toscrape.com and get titles of the first 5 books"
 ## Features
 
 - **Natural language input** — describe tasks in plain English
-- **Autonomous planning** — LLM decomposes tasks into browser steps
-- **Headless browser control** — Playwright-powered Chromium, Firefox, or WebKit
-- **Structured data extraction** — tables, lists, links parsed from DOM
-- **Local-first LLM** — runs on Qwen3-8B via LM Studio (no cloud required)
+- **Dual engine** — browser-use (batched actions, fast) + crawl4ai (instant extraction)
+- **Smart routing** — auto-detects extraction vs interactive tasks, picks the fastest engine
+- **Batched actions** — LLM returns up to 10 actions per call instead of 1 (3-10x faster)
+- **Web UI dashboard** — live browser view, execution log, manual takeover control
+- **Take Control mode** — click and type directly on the browser from the web UI for CAPTCHAs/login
+- **Headless or visible** — watch the browser work or run silently in the background
+- **Local-first LLM** — runs on Qwen3 via LM Studio (no cloud required)
 - **Cloud fallback** — supports Anthropic (Claude) and OpenAI (GPT-4o)
 - **Rich terminal UI** — colored output, progress steps, formatted tables
 - **Export to CSV/JSON** — save extracted data to files
 - **Run history** — SQLite-backed history with replay support
-- **Cookie persistence** — authenticated sessions for login-required sites
-- **Vision + DOM hybrid** — screenshots and simplified DOM for accurate decisions
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CLI Layer                               │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
-│  │  main.py    │  │  display.py  │  │  Click Commands        │  │
-│  │  (commands) │  │  (Rich UI)   │  │  run/history/config    │  │
-│  └──────┬──────┘  └──────┬───────┘  └────────────────────────┘  │
-│         │                │                                      │
-└─────────┼────────────────┼──────────────────────────────────────┘
-          │                │
-          ▼                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Agent Layer                              │
-│                                                                 │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐  │
-│  │  planner.py │  │ executor.py  │  │  memory.py             │  │
-│  │  (task      │  │ (perception- │  │  (sliding window       │  │
-│  │   planning) │  │  action loop)│  │   context manager)     │  │
-│  └──────┬──────┘  └──────┬───────┘  └────────────────────────┘  │
-│         │                │                                      │
-│         │         ┌──────┴───────┐                               │
-│         │         │ observer.py  │                               │
-│         │         │ (page state  │                               │
-│         │         │  capture)    │                               │
-│         │         └──────┬───────┘                               │
-└─────────┼────────────────┼──────────────────────────────────────┘
-          │                │
-          ▼                ▼
-┌──────────────────┐ ┌────────────────────────────────────────────┐
-│    LLM Layer     │ │              Browser Layer                 │
-│                  │ │                                            │
-│ ┌──────────────┐ │ │ ┌────────────┐ ┌──────────┐ ┌───────────┐ │
-│ │  client.py   │ │ │ │ driver.py  │ │actions.py│ │extractor  │ │
-│ │  (unified    │ │ │ │ (Playwright│ │(typed    │ │.py (DOM   │ │
-│ │   LLM API)  │ │ │ │  wrapper)  │ │ action   │ │ data      │ │
-│ │              │ │ │ │            │ │ prims)   │ │ parsing)  │ │
-│ ├──────────────┤ │ │ └─────┬──────┘ └──────────┘ └───────────┘ │
-│ │  prompts.py  │ │ │       │                                   │
-│ │  (system     │ │ │       ▼                                   │
-│ │   prompts)   │ │ │  ┌─────────────────────────────────┐      │
-│ ├──────────────┤ │ │  │  Chromium / Firefox / WebKit    │      │
-│ │  schemas.py  │ │ │  │  (headless or visible)          │      │
-│ │  (Pydantic   │ │ │  └─────────────────────────────────┘      │
-│ │   models)    │ │ │                                            │
-│ └──────────────┘ │ └────────────────────────────────────────────┘
-└──────────────────┘
-          │
-          ▼
-┌──────────────────┐
-│  Storage Layer   │
-│                  │
-│ ┌──────────────┐ │    ┌──────────────────────────────────┐
-│ │  runs.py     │ │    │  ~/.browseagent/                 │
-│ │  (SQLite)    │─┼───▶│  ├── config.yaml                 │
-│ ├──────────────┤ │    │  └── runs/                       │
-│ │  export.py   │ │    │      ├── runs.db                 │
-│ │  (CSV/JSON)  │ │    │      └── <run-id>/results.json   │
-│ └──────────────┘ │    └──────────────────────────────────┘
-└──────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Interface Layer                                │
+│                                                                     │
+│  ┌───────────────────┐         ┌──────────────────────────────────┐ │
+│  │  CLI (Click)      │         │  Web UI (FastAPI + WebSocket)    │ │
+│  │  agent run/ui/    │         │  Live browser view, takeover,    │ │
+│  │  history/config   │         │  click/type forwarding           │ │
+│  └────────┬──────────┘         └──────────────┬───────────────────┘ │
+│           │                                   │                     │
+└───────────┼───────────────────────────────────┼─────────────────────┘
+            │                                   │
+            ▼                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       Engine Layer (engine.py)                      │
+│                                                                     │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
+│  │  Smart Router   │  │  browser-use     │  │  crawl4ai         │  │
+│  │  (auto-detect   │─▶│  (interactive    │  │  (fast extraction │  │
+│  │   task type)    │  │   batched agent) │  │   no LLM needed)  │  │
+│  └─────────────────┘  └────────┬─────────┘  └───────────────────┘  │
+│                                │                                    │
+│                     ┌──────────┴──────────┐                         │
+│                     │ Batched Actions     │                         │
+│                     │ 10 actions per LLM  │                         │
+│                     │ call = 3-10x faster │                         │
+│                     └──────────┬──────────┘                         │
+│                                │                                    │
+└────────────────────────────────┼────────────────────────────────────┘
+                                 │
+            ┌────────────────────┼────────────────────┐
+            ▼                    ▼                    ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  LLM Provider    │ │  Browser         │ │  Storage         │
+│                  │ │  (Playwright)    │ │                  │
+│ LM Studio(local) │ │  Chromium/       │ │  SQLite runs.db  │
+│ OpenAI (cloud)   │ │  Firefox/WebKit  │ │  CSV/JSON export │
+│ Anthropic(cloud) │ │  CDP protocol    │ │  Run history     │
+└──────────────────┘ └──────────────────┘ └──────────────────┘
 ```
+
+---
+
+## Engines
+
+BrowseAgent uses a **dual-engine architecture** for maximum speed:
+
+### browser-use (Interactive Tasks)
+
+Used for tasks that require clicking, typing, navigating, and interacting with web pages.
+
+- **Batched actions** — LLM returns up to 10 actions per inference call, reducing round-trips
+- **Message compaction** — compresses conversation history to stay within context limits
+- **DOM indexing** — serializes only interactive elements, not the full page
+- **Auto-navigation** — detects URLs in tasks and navigates directly
+- **Loop detection** — breaks out of repetitive action patterns
+- **Error recovery** — retries failed actions with different strategies
+
+```python
+# Under the hood, one LLM call returns multiple actions:
+# Step 1: navigate → books.toscrape.com, extract titles, done
+# vs old approach: 10 separate LLM calls for 10 actions
+```
+
+### crawl4ai (Extraction Tasks)
+
+Used for tasks that just need to **extract data** from a URL — no clicking or interaction.
+
+- **Zero LLM calls** — uses CSS/XPath selectors, not LLM per action
+- **Sub-second per page** — 10-50x faster than browser-based extraction
+- **Auto-detected** — if the task says "get/extract/scrape" + has a URL, crawl4ai runs first
+
+### Smart Router
+
+The engine layer automatically picks the best approach:
+
+```
+"extract titles from books.toscrape.com"  → crawl4ai (instant)
+"search Google for Python tutorials"      → browser-use (interactive)
+"fill out the contact form on example.com" → browser-use (interactive)
+```
+
+If crawl4ai doesn't get useful results, it falls back to browser-use automatically.
+
+---
+
+## Web UI
+
+Launch the web dashboard for a visual browser automation experience:
+
+```bash
+agent ui
+# Opens at http://127.0.0.1:8899
+```
+
+### Features
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  BrowseAgent                    CONNECTED   RUNNING    Max: 40  │
+├──────────────────────┬──────────────────────────────────────────┤
+│                      │                                          │
+│  Task Input          │         Live Browser View                │
+│  ┌────────────────┐  │                                          │
+│  │ your task here │  │    ┌──────────────────────────────┐      │
+│  └────────────────┘  │    │                              │      │
+│  [Run]               │    │  Real-time screenshot        │      │
+│                      │    │  stream from the browser     │      │
+│  Plan                │    │                              │      │
+│  Goal: ...           │    │  Click and type here         │      │
+│  Strategy: ...       │    │  during Take Control mode    │      │
+│                      │    │                              │      │
+│  Execution Log       │    └──────────────────────────────┘      │
+│  Step 1/10: click    │                                          │
+│  Step 2/10: type     │    [Take Control] [Pause] [Stop]         │
+│  Step 3/10: done     │                                          │
+│                      ├──────────────────────────────────────────┤
+│  Extracted Data      │  Manual Control Active                   │
+│  ┌──────────────┐    │  Click and type directly on browser view │
+│  │ title  price │    │  [Resume Automation]                     │
+│  │ ...    ...   │    │                                          │
+│  └──────────────┘    │                                          │
+├──────────────────────┴──────────────────────────────────────────┤
+```
+
+### Take Control Mode
+
+When you hit a CAPTCHA, login wall, or need to enter credentials:
+
+1. Click **Take Control** in the browser panel
+2. The automation pauses
+3. **Click and type directly on the browser view** — your clicks and keystrokes are forwarded to the actual browser via CDP
+4. Solve the CAPTCHA, log in, or interact as needed
+5. Click **Resume Automation** — the agent continues from where you left off
+
+This works entirely in the web UI — no need to alt-tab to find a browser window.
+
+### Controls
+
+| Button | Action |
+|--------|--------|
+| **Run** | Start a new task |
+| **Take Control** | Pause automation, enable manual interaction |
+| **Pause** | Pause the agent mid-execution |
+| **Resume** | Continue after pause or takeover |
+| **Stop** | Cancel the current task |
 
 ---
 
 ## How It Works
 
-The agent follows a 6-phase pipeline for every task:
+### For Interactive Tasks (browser-use engine)
 
 ```
- User Task ──▶ Phase 1 ──▶ Phase 2 ──▶ Phase 3 ──▶ Phase 4 ──▶ Phase 5 ──▶ Phase 6
-  (string)     PLAN        LAUNCH      OBSERVE     DECIDE +     EXTRACT     OUTPUT
-               (LLM)      (Browser)    (DOM +       ACT         (data)     (table +
-                                       screenshot)  (loop)                  export)
+User Task
+    │
+    ▼
+┌─────────┐     ┌──────────────┐     ┌────────────────────┐
+│  Smart   │────▶│  browser-use │────▶│  Playwright Browser │
+│  Router  │     │  Agent       │     │  (visible or        │
+└─────────┘     │              │     │   headless)          │
+                │  Batched     │     └─────────┬────────────┘
+                │  LLM calls   │               │
+                │  (10 actions │     ┌─────────▼────────────┐
+                │   per call)  │     │  Screenshots stream  │
+                └──────┬───────┘     │  to Web UI via WS    │
+                       │             └──────────────────────┘
+                       ▼
+                ┌──────────────┐
+                │  Results     │
+                │  CSV / JSON  │
+                │  SQLite      │
+                └──────────────┘
 ```
 
-### Phase 1 — Task Planning (LLM Call #1)
-
-The task string is sent to the LLM with a planner prompt. The model returns a structured plan:
-
-```json
-{
-  "goal": "Find 10 software engineer leads from LinkedIn in Mumbai",
-  "steps_estimate": 12,
-  "first_url": "https://www.linkedin.com/search/results/people/",
-  "plan_summary": "Search LinkedIn, apply location filter, extract profile data"
-}
-```
-
-### Phase 2 — Browser Launch
-
-Playwright launches a Chromium instance (headless by default) with a realistic user agent and 1280x800 viewport. Navigates to the `first_url` from the plan.
-
-### Phase 3 — Observe Page State
-
-Each loop iteration captures a snapshot of the current page:
-
-- **Simplified DOM** — visible text, links, buttons, inputs, headings (not raw HTML)
-- **Screenshot** — optional base64 PNG for vision-capable models
-- **URL + title** — current page metadata
-
-The DOM simplification extracts up to 200 elements in a structured format:
+**Batched action flow** (vs old approach):
 
 ```
-[link] "Learn more" → a[href="https://example.com"]
-[button] "Search" → #search-btn
-[input:text] "query" (current: "") → input[name="q"]
-[h1] "Welcome to Example"
-[text] "This is a paragraph of content..."
+Old (slow):                          New (fast):
+  LLM call → 1 action → execute       LLM call → 10 actions → execute all
+  LLM call → 1 action → execute       LLM call → 5 actions  → execute all
+  LLM call → 1 action → execute       LLM call → done        → return data
+  LLM call → 1 action → execute
+  LLM call → 1 action → execute       3 LLM calls total (vs 10+)
+  ...                                  3-10x faster
+  10+ LLM calls total
 ```
 
-### Phase 4 — Decide + Act (LLM Call #2...N)
+### For Extraction Tasks (crawl4ai engine)
 
-The LLM receives the observation and decides the next action:
-
-```json
-{
-  "action": "type",
-  "target": "input[name='q']",
-  "value": "software engineer Mumbai",
-  "reasoning": "Need to enter the search query",
-  "confidence": 0.95
-}
+```
+User Task ──▶ crawl4ai ──▶ Fetch page ──▶ Parse HTML ──▶ Return data
+                              (httpx)      (no LLM!)      (instant)
 ```
 
-Available actions:
-
-| Action | Description | Playwright Call |
-|--------|-------------|-----------------|
-| `navigate` | Go to a URL | `page.goto(url)` |
-| `click` | Click an element | `page.click(selector)` |
-| `type` | Type into an input | `page.fill(selector, value)` |
-| `press` | Press a keyboard key | `page.keyboard.press(key)` |
-| `scroll` | Scroll up or down | `page.evaluate("window.scrollBy()")` |
-| `select` | Pick a dropdown option | `page.select_option(selector, value)` |
-| `extract` | Pull data from DOM | DOM parser or LLM extraction |
-| `wait` | Wait for page load | `page.wait_for_load_state("networkidle")` |
-| `done` | Task complete | Returns extracted data |
-
-### Phase 5 — Data Extraction
-
-When the LLM determines the task is complete, it returns structured data directly in the `done` action. Alternatively, the `extract` action triggers DOM-based extraction using CSS selectors.
-
-### Phase 6 — Output & Export
-
-Results are displayed as a Rich table in the terminal. Data is saved to SQLite for history and optionally exported to CSV or JSON.
+No browser launched. No LLM calls. Sub-second extraction.
 
 ### Error Recovery
 
-- If a selector is not found, the agent retries with a different approach
-- After 2 consecutive failures on the same target, the step is skipped
-- The full error context is fed back to the LLM for self-correction
-
-```
-Perception-Action Loop Detail:
-
-    ┌────────────┐
-    │  Observe   │◄──────────────────────────────┐
-    │  (DOM +    │                               │
-    │  screenshot│                               │
-    └─────┬──────┘                               │
-          │                                      │
-          ▼                                      │
-    ┌────────────┐                               │
-    │  Decide    │                               │
-    │  (LLM call)│                               │
-    └─────┬──────┘                               │
-          │                                      │
-          ▼                                      │
-    ┌────────────┐    ┌────────┐                 │
-    │  action == ├───▶│ Return │                 │
-    │  "done"?   │yes │ data   │                 │
-    └─────┬──────┘    └────────┘                 │
-          │ no                                   │
-          ▼                                      │
-    ┌────────────┐                               │
-    │  Execute   │                               │
-    │  (browser  │───────────────────────────────┘
-    │   action)  │
-    └────────────┘
-```
+- **Action failures** — retried with different selectors
+- **Loop detection** — breaks repetitive patterns automatically
+- **Timeout handling** — steps capped at 300s, graceful fallback
+- **CAPTCHA/login** — pauses for manual takeover via Web UI
 
 ---
 
@@ -259,13 +281,13 @@ Perception-Action Loop Detail:
 
 - **Python 3.11+**
 - **LM Studio** (for local LLM) — download from [lmstudio.ai](https://lmstudio.ai)
-- A model loaded in LM Studio (recommended: Qwen3-8B or similar)
+- A model loaded in LM Studio with **32K+ context length** (recommended: Qwen3-8B or Qwen3.5-9B)
 
 ### Install from source
 
 ```bash
-git clone https://github.com/your-username/browseagent.git
-cd browseagent
+git clone https://github.com/vikast908/BrowserAgentCLI.git
+cd BrowserAgentCLI
 pip install -e .
 playwright install chromium
 ```
@@ -283,27 +305,34 @@ agent --help
 
 ### 1. Start LM Studio
 
-Load a model (e.g., Qwen3-8B) and start the local server on `localhost:1234`.
+Load a model (e.g., Qwen3.5-9B) with **32K+ context length** and start the local server on `localhost:1234`.
 
-### 2. Run your first task
+### 2. Run your first task (CLI)
 
 ```bash
-agent run "go to https://books.toscrape.com and get the titles and prices of the first 5 books"
+agent run "go to https://books.toscrape.com and get the titles of the first 5 books"
 ```
 
-### 3. Save results to a file
+### 3. Launch the Web UI
+
+```bash
+agent ui
+# Open http://127.0.0.1:8899 in your browser
+```
+
+### 4. Save results to a file
 
 ```bash
 agent run "extract the pricing table from stripe.com/pricing" --output pricing.csv
 ```
 
-### 4. Debug with visible browser
+### 5. Debug with visible browser
 
 ```bash
 agent run "fill out the contact form on example.com" --no-headless
 ```
 
-### 5. Use a cloud model
+### 6. Use a cloud model (faster)
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -331,21 +360,25 @@ agent run "your task description" [OPTIONS]
 | `--max-steps` | | Cap execution steps | `40` |
 | `--screenshot` | | Save screenshots of each step | `false` |
 
+### `agent ui`
+
+Launch the web UI dashboard.
+
+```bash
+agent ui [OPTIONS]
+```
+
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--host` | `-h` | Server host | `127.0.0.1` |
+| `--port` | `-p` | Server port | `8899` |
+
 ### `agent history`
 
 List recent runs.
 
 ```bash
 agent history [-n 20]
-```
-
-```
-┌──────────────┬───────────────────┬───────────┬───────┬───────┬─────────────┐
-│ Run ID       │ Task              │ Status    │ Steps │ Time  │ Date        │
-├──────────────┼───────────────────┼───────────┼───────┼───────┼─────────────┤
-│ 41e322d046ae │ go to books.to... │ completed │ 3     │ 30.3s │ 2026-04-05  │
-│ 8f2a1bc93d01 │ extract pricing.. │ completed │ 7     │ 45.1s │ 2026-04-04  │
-└──────────────┴───────────────────┴───────────┴───────┴───────┴─────────────┘
 ```
 
 ### `agent replay <run-id>`
@@ -361,13 +394,8 @@ agent replay 41e322d046ae
 View or modify configuration.
 
 ```bash
-# Show all settings
-agent config get
-
-# Show a specific setting
-agent config get default-model
-
-# Change a setting
+agent config get              # Show all settings
+agent config get default-model # Show one setting
 agent config set default-model qwen3-8b
 agent config set headless false
 agent config set max-steps 30
@@ -411,18 +439,16 @@ export OPENAI_API_KEY=sk-...
 
 Runs locally via an OpenAI-compatible API. No data leaves your machine.
 
-```bash
-# Default — uses LM Studio at localhost:1234
-agent run "your task"
+**Important:** Load your model with **32K+ context length** — browser-use's prompts are ~8K tokens.
 
-# Custom URL
+```bash
+agent run "your task"
 agent config set lm-studio-url http://localhost:8080
 ```
 
 **Recommended models:**
-- Qwen3-8B (4-bit, fits in 8GB VRAM)
-- Qwen3.5-9B
-- Any model with strong instruction following and JSON output
+- Qwen3.5-9B (best balance of speed and quality)
+- Qwen3-8B (lighter, fits in 8GB VRAM)
 
 ### Anthropic (Claude)
 
@@ -446,26 +472,34 @@ agent run "your task" --provider openai --model gpt-4o
 browseagent/
 ├── __init__.py                # Package version
 ├── config.py                  # Settings dataclass + YAML loader
+├── engine.py                  # Dual-engine: browser-use + crawl4ai + smart router
 │
 ├── cli/
-│   ├── main.py                # Click commands (run, history, config)
+│   ├── main.py                # Click commands (run, ui, history, config)
 │   └── display.py             # Rich terminal UI (tables, spinners, steps)
 │
-├── agent/
-│   ├── planner.py             # LLM task decomposition → PlanSchema
-│   ├── executor.py            # Core observe → decide → act loop
-│   ├── observer.py            # Page state capture (DOM + screenshot)
+├── ui/
+│   ├── server.py              # FastAPI + WebSocket server
+│   └── static/
+│       ├── index.html         # Split-pane dashboard layout
+│       ├── style.css          # Dark theme styling
+│       └── app.js             # WebSocket client, click/key forwarding
+│
+├── agent/                     # Legacy custom agent (kept for reference)
+│   ├── planner.py             # LLM task decomposition
+│   ├── executor.py            # Custom perception-action loop
+│   ├── observer.py            # Page state capture
 │   └── memory.py              # Sliding window context manager
 │
-├── browser/
-│   ├── driver.py              # Playwright wrapper (launch, navigate, act)
-│   ├── actions.py             # Standalone action primitives
-│   └── extractor.py           # DOM → structured data extraction
+├── browser/                   # Legacy browser primitives
+│   ├── driver.py              # Playwright wrapper
+│   ├── actions.py             # Action primitives
+│   └── extractor.py           # DOM data extraction
 │
-├── llm/
-│   ├── client.py              # Unified LLM client (local + cloud)
-│   ├── prompts.py             # Planner & executor system prompts
-│   └── schemas.py             # Pydantic models (Plan, Action, Observation)
+├── llm/                       # Legacy LLM layer
+│   ├── client.py              # Unified LLM client
+│   ├── prompts.py             # System prompts
+│   └── schemas.py             # Pydantic models
 │
 └── storage/
     ├── runs.py                # SQLite run history
@@ -474,87 +508,39 @@ browseagent/
 
 ---
 
-## Module Reference
-
-### config.py
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `Settings` | dataclass | Runtime configuration with defaults |
-| `load_settings()` | function | Load from `~/.browseagent/config.yaml` |
-| `save_settings()` | function | Persist to YAML (excludes API keys) |
-
-### llm/schemas.py
-
-| Schema | Fields | Description |
-|--------|--------|-------------|
-| `ActionType` | enum | 9 action types (navigate, click, type, press, scroll, select, extract, wait, done) |
-| `PlanSchema` | goal, steps_estimate, first_url, plan_summary | Task plan from planner LLM |
-| `ActionSchema` | action, target, value, reasoning, confidence, data | Single action from executor LLM |
-| `ObservationSchema` | url, title, dom_text, screenshot_b64, timestamp | Page state snapshot |
-| `StepRecord` | step_number, observation, action, success, error | Full step trace |
-| `RunResultSchema` | run_id, task, plan, steps, data, status, timing | Complete run result |
-
-### llm/client.py
-
-| Symbol | Description |
-|--------|-------------|
-| `LLMClient` | Unified async client for LM Studio, OpenAI, and Anthropic |
-| `chat()` | Send messages, optionally request JSON output |
-| `chat_structured()` | Chat and return validated Pydantic model (with retries) |
-| `_extract_json()` | Strip `<think>` tags, code fences, find JSON in raw output |
-
-### browser/driver.py
-
-| Method | Description |
-|--------|-------------|
-| `launch()` | Start Playwright + browser with configured viewport/user-agent |
-| `navigate(url)` | Go to URL, wait for DOM content loaded |
-| `screenshot()` | Capture page as base64 PNG |
-| `get_dom_simplified()` | Extract links, buttons, inputs, headings, text (up to 200 elements) |
-| `execute_action(action)` | Map ActionSchema to Playwright call |
-| `load_cookies() / save_cookies()` | Persist authenticated sessions |
-
-### agent/executor.py
-
-| Symbol | Description |
-|--------|-------------|
-| `AgentExecutor` | Orchestrates the full plan → launch → loop → export pipeline |
-| `run(task)` | Execute a complete agent run, returns RunResultSchema |
-| `on_plan / on_step / on_error` | Callbacks for CLI display integration |
-
-### storage/runs.py
-
-| Method | Description |
-|--------|-------------|
-| `RunStore.save_run()` | Insert run to SQLite + save results.json |
-| `RunStore.list_runs()` | Recent runs sorted by date |
-| `RunStore.get_run()` | Full run details by ID |
-
----
-
 ## Limitations & Guardrails
 
 | Limitation | Mitigation |
 |---|---|
-| Sites requiring login (LinkedIn, etc.) | Pre-login via `load_cookies()`; cookie persistence |
-| CAPTCHAs / bot detection | Flagged to user; agent pauses with `wait` action |
-| Dynamic JS-heavy SPAs | Playwright waits for `networkidle` before observation |
-| LLM hallucinating selectors | DOM simplifier provides real selectors; validation before click |
-| Local LLM JSON reliability | `json_schema` response format + retry with stricter prompt |
-| Infinite scroll / pagination | `max-steps` cap; smart "load more" detection |
-| Large DOM pages | Truncated to 6000 chars to fit LLM context window |
+| Sites requiring login | Take Control mode in Web UI — manually log in, then resume |
+| CAPTCHAs / bot detection | Take Control mode — solve manually, agent continues |
+| Local LLM speed | Use cloud models (Anthropic/OpenAI) for 5-10x faster inference |
+| Context length | Load model with 32K+ context in LM Studio |
+| Large DOM pages | `max_clickable_elements_length` caps DOM sent to LLM |
+| Infinite loops | Built-in loop detection breaks repetitive patterns |
+| Extract tool slow | Agent instructed to use `done` action directly instead |
+
+---
+
+## Speed Optimization Tips
+
+| Approach | Speedup | How |
+|---|---|---|
+| **Use cloud LLM** | 5-10x | `--provider openai --model gpt-4o-mini` (1s/call vs 10-15s local) |
+| **Batched actions** | 3-5x | Default with browser-use engine (10 actions per LLM call) |
+| **Extraction tasks** | 10-50x | Auto-detected, uses crawl4ai (no LLM needed) |
+| **Reduce max steps** | Linear | `--max-steps 10` for simple tasks |
+| **Increase context** | Avoids retries | Load model with 32K+ context in LM Studio |
 
 ---
 
 ## Roadmap
 
 - [ ] **Session management** — `agent login <site>` command to save authenticated cookies
-- [ ] **Step-by-step debug mode** — pause between steps in `--no-headless` mode
 - [ ] **Parallel extraction** — multiple pages open simultaneously
+- [ ] **Stagehand integration** — cached selectors for repeatable workflows
+- [ ] **Direct HTTP fallback** — skip browser entirely for API-backed sites
 - [ ] **Plugin system** — custom extractors for specific sites
-- [ ] **Proxy support** — rotate IPs for large-scale scraping
-- [ ] **PDF / screenshot export** — save full-page renders per step
 - [ ] **MCP integration** — expose as a tool for other AI agents
 
 ---
@@ -564,10 +550,14 @@ browseagent/
 | Layer | Technology | Purpose |
 |---|---|---|
 | Language | Python 3.11+ | Async ecosystem for AI + browser |
+| Browser Agent | browser-use | Batched LLM actions, DOM indexing, error recovery |
+| Fast Extraction | crawl4ai | Zero-LLM data extraction via CSS/XPath |
+| Browser Engine | Playwright + CDP | Chromium/Firefox/WebKit automation |
 | CLI | Click | Argument parsing, help generation |
-| Browser | Playwright (async) | Headless Chromium/Firefox/WebKit |
-| LLM (local) | Qwen3-8B via LM Studio | OpenAI-compatible API at localhost |
-| LLM (cloud) | Claude / GPT-4o | Higher-quality planning & vision |
+| Web UI | FastAPI + WebSocket | Real-time dashboard with live browser view |
+| Frontend | Vanilla HTML/CSS/JS | Dark theme, split-pane, click forwarding |
+| LLM (local) | Qwen3 via LM Studio | OpenAI-compatible API at localhost |
+| LLM (cloud) | Claude / GPT-4o | Faster inference for production use |
 | Terminal UI | Rich | Tables, spinners, colored output |
 | Validation | Pydantic v2 | Structured LLM output schemas |
 | Storage | SQLite | Run history and metadata |
