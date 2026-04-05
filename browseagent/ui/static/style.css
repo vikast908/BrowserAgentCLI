@@ -511,44 +511,44 @@ html, body {
   border-radius: 2px;
 }
 
-/* ── Takeover Overlay ──────────────────────────────── */
-.takeover-overlay {
+/* ── Takeover Input Layer ──────────────────────────── */
+.takeover-input-layer {
   position: absolute;
   inset: 0;
-  background: rgba(15, 17, 23, 0.92);
+  z-index: 5;
+  cursor: pointer;
+  outline: none;
+}
+
+.takeover-input-layer:focus {
+  outline: none;
+}
+
+.takeover-input-layer.active {
+  cursor: crosshair;
+  border: 2px solid var(--warning);
+  border-radius: 2px;
+}
+
+/* ── Takeover Banner ──────────────────────────────── */
+.takeover-banner {
   display: flex;
   align-items: center;
-  justify-content: center;
-  z-index: 10;
-  backdrop-filter: blur(4px);
-}
-
-.takeover-content {
-  text-align: center;
-  max-width: 360px;
-}
-
-.takeover-icon {
-  font-size: 48px;
-  margin-bottom: 12px;
-}
-
-.takeover-content h3 {
-  font-size: 18px;
-  margin-bottom: 10px;
+  gap: 10px;
+  padding: 8px 16px;
+  background: rgba(253, 203, 110, 0.12);
+  border-top: 1px solid rgba(253, 203, 110, 0.3);
   color: var(--warning);
-}
-
-.takeover-content p {
   font-size: 13px;
-  color: var(--text-secondary);
-  line-height: 1.6;
-  margin-bottom: 8px;
+  flex-shrink: 0;
 }
 
-.takeover-content .btn {
-  margin-top: 16px;
-  padding: 10px 28px;
+.takeover-banner-icon {
+  font-size: 18px;
+}
+
+.takeover-banner .btn {
+  margin-left: auto;
 }
 
 /* ── Utility ───────────────────────────────────────── */

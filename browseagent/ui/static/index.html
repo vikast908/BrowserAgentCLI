@@ -87,25 +87,22 @@
           </button>
         </div>
       </div>
-      <div class="browser-viewport">
+      <div class="browser-viewport" id="browser-viewport">
         <div id="browser-placeholder" class="browser-placeholder">
           <div class="placeholder-icon">&#127760;</div>
           <div class="placeholder-text">Browser will appear here when a task is running</div>
         </div>
         <img id="browser-screenshot" class="browser-screenshot hidden" alt="Browser view" />
+        <!-- Takeover input overlay — transparent, captures clicks/keys -->
+        <div id="takeover-input-layer" class="takeover-input-layer hidden" tabindex="0"></div>
       </div>
-      <!-- Takeover Overlay -->
-      <div id="takeover-overlay" class="takeover-overlay hidden">
-        <div class="takeover-content">
-          <div class="takeover-icon">&#9995;</div>
-          <h3>Manual Control Active</h3>
-          <p>The browser window is open on your desktop.<br/>
-          Solve the CAPTCHA, log in, or interact as needed.</p>
-          <p class="muted">Click <strong>Resume</strong> when you're done.</p>
-          <button id="btn-resume-takeover" class="btn btn-primary">
-            <span class="btn-icon">&#9654;</span> Resume Automation
-          </button>
-        </div>
+      <!-- Takeover Banner (compact, non-blocking) -->
+      <div id="takeover-banner" class="takeover-banner hidden">
+        <span class="takeover-banner-icon">&#9995;</span>
+        <span><strong>Manual Control Active</strong> &mdash; Click and type directly on the browser view above</span>
+        <button id="btn-resume-takeover" class="btn btn-sm btn-primary">
+          <span class="btn-icon">&#9654;</span> Resume Automation
+        </button>
       </div>
     </section>
   </main>

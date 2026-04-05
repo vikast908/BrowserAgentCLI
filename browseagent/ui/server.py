@@ -311,6 +311,51 @@ class UISession:
         self._takeover_active = True
         self._paused.set()  # Don't block the loop, let it enter takeover wait
 
+    async def mouse_click(self, x: int, y: int) -> None:
+        """Forward a mouse click to the browser at (x, y) viewport coords."""
+        if self.executor and self.executor.driver._page:
+            try:
+                await self.executor.driver._page.mouse.click(x, y)
+                # Send updated screenshot immediately
+                await asyncio.sleep(0.3)
+                ss = await self.executor.driver.screenshot()
+                await self.send("screenshot", {"image": ss})
+            except Exception as exc:
+                logger.warning("Mouse click failed at (%d, %d): %s", x, y, exc)
+
+    async def mouse_dblclick(self, x: int, y: int) -> None:
+        """Forward a double-click to the browser."""
+        if self.executor and self.executor.driver._page:
+            try:
+                await self.executor.driver._page.mouse.dblclick(x, y)
+                await asyncio.sleep(0.3)
+                ss = await self.executor.driver.screenshot()
+                await self.send("screenshot", {"image": ss})
+            except Exception as exc:
+                logger.warning("Double-click failed at (%d, %d): %s", x, y, exc)
+
+    async def key_press(self, key: str) -> None:
+        """Forward a key press to the browser."""
+        if self.executor and self.executor.driver._page and key:
+            try:
+                await self.executor.driver._page.keyboard.press(key)
+                await asyncio.sleep(0.15)
+                ss = await self.executor.driver.screenshot()
+                await self.send("screenshot", {"image": ss})
+            except Exception as exc:
+                logger.warning("Key press failed (%s): %s", key, exc)
+
+    async def type_text(self, text: str) -> None:
+        """Forward typed text to the browser (single characters)."""
+        if self.executor and self.executor.driver._page and text:
+            try:
+                await self.executor.driver._page.keyboard.type(text)
+                await asyncio.sleep(0.1)
+                ss = await self.executor.driver.screenshot()
+                await self.send("screenshot", {"image": ss})
+            except Exception as exc:
+                logger.warning("Type text failed (%s): %s", text, exc)
+
 
 # Active sessions keyed by WebSocket
 _sessions: dict[int, UISession] = {}
@@ -358,6 +403,18 @@ async def websocket_endpoint(ws: WebSocket):
             elif cmd == "takeover":
                 session.takeover()
                 await session.send("status", {"state": "takeover"})
+
+            elif cmd == "mouse_click":
+                await session.mouse_click(msg.get("x", 0), msg.get("y", 0))
+
+            elif cmd == "mouse_dblclick":
+                await session.mouse_dblclick(msg.get("x", 0), msg.get("y", 0))
+
+            elif cmd == "key_press":
+                await session.key_press(msg.get("key", ""))
+
+            elif cmd == "type_text":
+                await session.type_text(msg.get("text", ""))
 
             elif cmd == "update_settings":
                 if "max_steps" in msg:

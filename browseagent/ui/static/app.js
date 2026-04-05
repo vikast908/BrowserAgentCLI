@@ -18,7 +18,9 @@
   const stepLog = $("#step-log");
   const screenshot = $("#browser-screenshot");
   const placeholder = $("#browser-placeholder");
-  const takeoverOverlay = $("#takeover-overlay");
+  const takeoverBanner = $("#takeover-banner");
+  const takeoverInputLayer = $("#takeover-input-layer");
+  const browserViewport = $("#browser-viewport");
   const resultsArea = $("#results-area");
   const resultsWrapper = $("#results-table-wrapper");
   const connBadge = $("#connection-badge");
@@ -26,6 +28,11 @@
 
   let ws = null;
   let isRunning = false;
+  let isTakeover = false;
+
+  // Browser viewport dimensions (Playwright default)
+  const BROWSER_WIDTH = 1280;
+  const BROWSER_HEIGHT = 800;
 
   // ── WebSocket Connection ───────────────────────────
   function connect() {
@@ -106,7 +113,7 @@
 
       case "running":
         setBadge(stateBadge, "running", "Running");
-        takeoverOverlay.classList.add("hidden");
+        exitTakeover();
         btnPause.classList.remove("hidden");
         btnResume.classList.add("hidden");
         break;
@@ -121,12 +128,13 @@
 
       case "takeover":
         setBadge(stateBadge, "takeover", "Manual Control");
-        takeoverOverlay.classList.remove("hidden");
-        log("warn", "Manual control active \u2014 interact with the browser window on your desktop.");
+        enterTakeover();
+        log("warn", "Manual control active \u2014 click and type directly on the browser view.");
         break;
 
       case "stopped":
         setBadge(stateBadge, "failed", "Stopped");
+        exitTakeover();
         setIdle();
         log("warn", "Task stopped by user.");
         break;
@@ -136,6 +144,128 @@
         break;
     }
   }
+
+  // ── Takeover Mode ──────────────────────────────────
+  function enterTakeover() {
+    isTakeover = true;
+    takeoverBanner.classList.remove("hidden");
+    takeoverInputLayer.classList.remove("hidden");
+    takeoverInputLayer.classList.add("active");
+    takeoverInputLayer.focus();
+  }
+
+  function exitTakeover() {
+    isTakeover = false;
+    takeoverBanner.classList.add("hidden");
+    takeoverInputLayer.classList.add("hidden");
+    takeoverInputLayer.classList.remove("active");
+  }
+
+  /**
+   * Translate a mouse event on the screenshot/input-layer
+   * into (x, y) coordinates in the actual browser viewport.
+   */
+  function toBrowserCoords(e) {
+    const rect = screenshot.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+
+    // Mouse position relative to the displayed image
+    const relX = e.clientX - rect.left;
+    const relY = e.clientY - rect.top;
+
+    // Scale to actual browser viewport
+    const x = Math.round((relX / rect.width) * BROWSER_WIDTH);
+    const y = Math.round((relY / rect.height) * BROWSER_HEIGHT);
+
+    if (x < 0 || y < 0 || x > BROWSER_WIDTH || y > BROWSER_HEIGHT) return null;
+    return { x, y };
+  }
+
+  // ── Takeover: Mouse Events ─────────────────────────
+  takeoverInputLayer.addEventListener("click", (e) => {
+    if (!isTakeover) return;
+    const coords = toBrowserCoords(e);
+    if (coords) {
+      sendCommand("mouse_click", { x: coords.x, y: coords.y });
+      showClickRipple(e.clientX, e.clientY);
+    }
+  });
+
+  takeoverInputLayer.addEventListener("dblclick", (e) => {
+    if (!isTakeover) return;
+    const coords = toBrowserCoords(e);
+    if (coords) {
+      sendCommand("mouse_dblclick", { x: coords.x, y: coords.y });
+    }
+  });
+
+  // ── Takeover: Keyboard Events ──────────────────────
+  takeoverInputLayer.addEventListener("keydown", (e) => {
+    if (!isTakeover) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Map browser key names to Playwright key names
+    const key = mapKey(e);
+    if (key) {
+      sendCommand("key_press", { key });
+    }
+  });
+
+  takeoverInputLayer.addEventListener("keypress", (e) => {
+    if (!isTakeover) return;
+    e.preventDefault();
+    e.stopPropagation();
+  });
+
+  function mapKey(e) {
+    // For printable single characters, send as type
+    if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      sendCommand("type_text", { text: e.key });
+      return null; // handled via type_text
+    }
+    // Special keys
+    const keyMap = {
+      Enter: "Enter",
+      Backspace: "Backspace",
+      Delete: "Delete",
+      Tab: "Tab",
+      Escape: "Escape",
+      ArrowUp: "ArrowUp",
+      ArrowDown: "ArrowDown",
+      ArrowLeft: "ArrowLeft",
+      ArrowRight: "ArrowRight",
+      Home: "Home",
+      End: "End",
+      PageUp: "PageUp",
+      PageDown: "PageDown",
+      " ": "Space",
+    };
+    return keyMap[e.key] || null;
+  }
+
+  // ── Click Ripple Effect ────────────────────────────
+  function showClickRipple(clientX, clientY) {
+    const ripple = document.createElement("div");
+    ripple.style.cssText = `
+      position: fixed; left: ${clientX - 12}px; top: ${clientY - 12}px;
+      width: 24px; height: 24px; border-radius: 50%;
+      border: 2px solid #fdcb6e; pointer-events: none; z-index: 999;
+      animation: ripple-fade 0.4s ease-out forwards;
+    `;
+    document.body.appendChild(ripple);
+    setTimeout(() => ripple.remove(), 500);
+  }
+
+  // Add ripple animation
+  const style = document.createElement("style");
+  style.textContent = `
+    @keyframes ripple-fade {
+      0% { transform: scale(0.5); opacity: 1; }
+      100% { transform: scale(2); opacity: 0; }
+    }
+  `;
+  document.head.appendChild(style);
 
   // ── Plan Display ───────────────────────────────────
   function showPlan(plan) {
@@ -173,8 +303,8 @@
       showResultsTable(msg.data);
     }
 
+    exitTakeover();
     setIdle();
-    takeoverOverlay.classList.add("hidden");
   }
 
   // ── Results Table ──────────────────────────────────
@@ -234,7 +364,7 @@
     planCard.classList.add("hidden");
     resultsArea.classList.add("hidden");
     resultsWrapper.innerHTML = "";
-    takeoverOverlay.classList.add("hidden");
+    exitTakeover();
 
     sendCommand("run", { task });
   }
