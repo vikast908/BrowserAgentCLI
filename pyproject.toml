@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "browseagent"
+version = "0.1.0"
+description = "CLI browser automation agent powered by LLMs"
+readme = {text = "CLI browser automation agent powered by LLMs", content-type = "text/plain"}
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "click>=8.1",
+    "playwright>=1.40",
+    "pydantic>=2.0",
+    "rich>=13.0",
+    "openai>=1.0",
+    "pyyaml>=6.0",
+    "anthropic>=0.20",
+]
+
+[project.scripts]
+agent = "browseagent.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["browseagent"]
