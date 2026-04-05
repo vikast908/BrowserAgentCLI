@@ -100,6 +100,22 @@ def run(
 
 
 @cli.command()
+@click.option("--host", "-h", default="127.0.0.1", help="Server host")
+@click.option("--port", "-p", default=8899, type=int, help="Server port")
+def ui(host: str, port: int) -> None:
+    """Launch the BrowseAgent web UI.
+
+    Opens a browser dashboard where you can type tasks, watch live execution,
+    and take manual control for CAPTCHAs or login.
+    """
+    console.print(f"\n  [bold cyan]*[/bold cyan] [bold]BrowseAgent UI[/bold]")
+    console.print(f"  Starting server at [underline]http://{host}:{port}[/underline]\n")
+
+    from browseagent.ui.server import start_server
+    start_server(host=host, port=port)
+
+
+@cli.command()
 @click.option("--limit", "-n", default=20, help="Number of recent runs to show")
 def history(limit: int) -> None:
     """List past agent runs."""
